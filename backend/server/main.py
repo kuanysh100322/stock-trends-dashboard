@@ -4,9 +4,15 @@ import re
 import sqlite3
 import json
 import time
+import collections
 
-from fastapi import FastAPI, HTTPException
+import csv
+import io
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 import yfinance as yf
 
 app = FastAPI(title="Stock Dashboard Backend", version="0.2.0")
@@ -18,6 +24,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Rate limiting — 60 requests per minute per IP (fixed window)
+# ---------------------------------------------------------------------------
+_rate_limit_store: dict = collections.defaultdict(list)
+RATE_LIMIT_MAX    = 60   # max requests
+RATE_LIMIT_WINDOW = 60   # seconds
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    ip  = request.client.host
+    now = time.time()
+
+    # Purge timestamps outside the current window
+    _rate_limit_store[ip] = [
+        ts for ts in _rate_limit_store[ip] if now - ts < RATE_LIMIT_WINDOW
+    ]
+
+    if len(_rate_limit_store[ip]) >= RATE_LIMIT_MAX:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please wait a moment and try again."},
+        )
+
+    _rate_limit_store[ip].append(now)
+    return await call_next(request)
 
 # ---------------------------------------------------------------------------
 # SQLite cache
@@ -234,6 +266,137 @@ def _compute_indicators(df, indicator_list: list) -> dict:
         result["MACD_hist"]   = _safe_list(macd - signal)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# ML feature engineering
+# ---------------------------------------------------------------------------
+def _build_features(df):
+    """
+    Build a feature matrix (pandas DataFrame) with 7 features per row.
+
+    Features:
+      rsi            — RSI(14)
+      macd_hist      — MACD histogram (MACD line - signal line)
+      ma_ratio       — Close / MA20  (measures distance above/below trend)
+      bb_position    — (Close - BB_lower) / (BB_upper - BB_lower), clamped [0,1]
+      daily_return   — percentage daily return
+      volatility_20  — 20-day rolling std of daily returns (as %)
+      volume_change  — percentage change in volume vs previous day
+
+    Rows where any feature is NaN are dropped — callers receive a clean matrix.
+    """
+    import pandas as pd
+    import numpy as np
+
+    close  = df["Close"].astype(float)
+    volume = df["Volume"].astype(float)
+
+    # RSI(14)
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    rsi   = 100 - (100 / (1 + rs))
+
+    # MACD histogram
+    ema12     = close.ewm(span=12, adjust=False).mean()
+    ema26     = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal    = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = macd_line - signal
+
+    # MA ratio
+    ma20     = close.rolling(20).mean()
+    ma_ratio = close / ma20
+
+    # BB position
+    std20    = close.rolling(20).std()
+    bb_upper = ma20 + 2 * std20
+    bb_lower = ma20 - 2 * std20
+    bb_range = bb_upper - bb_lower
+    bb_pos   = (close - bb_lower) / bb_range.replace(0, np.nan)
+    bb_pos   = bb_pos.clip(0, 1)
+
+    # Daily return
+    daily_return = close.pct_change() * 100
+
+    # 20-day rolling volatility of daily returns
+    volatility_20 = daily_return.rolling(20).std()
+
+    # Volume change
+    volume_change = volume.pct_change() * 100
+
+    # ma_ratio, bb_position, and rsi are excluded — they directly encode
+    # Close vs MA20, which is the label definition, causing perfect leakage.
+    # The 4 retained features are independent momentum/volatility signals.
+    features = pd.DataFrame({
+        "macd_hist":     macd_hist,
+        "daily_return":  daily_return,
+        "volatility_20": volatility_20,
+        "volume_change": volume_change,
+    }, index=df.index)
+
+    return features
+
+
+# ---------------------------------------------------------------------------
+# ML model training
+# ---------------------------------------------------------------------------
+
+# In-memory model cache: key = "ticker:period:interval" → trained model bundle
+_model_cache: dict = {}
+
+def _train_model(df, labels: list) -> dict:
+    """
+    Time-split train/test and fit a RandomForestClassifier.
+
+    Split rule: last 30 labeled rows = test, everything before = train.
+    Returns a bundle dict with the fitted model, split indices, and
+    the aligned feature/label arrays ready for evaluation.
+    """
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+
+    features = _build_features(df)
+
+    # Align features with labels, drop rows where any feature is NaN
+    import pandas as pd
+    label_series = pd.Series(labels, index=df.index, name="label")
+    combined     = features.join(label_series).dropna()
+
+    # Only keep rows with valid labels (no None)
+    combined = combined[combined["label"].isin(["invest", "no-invest"])]
+
+    if len(combined) < 40:
+        raise ValueError("Not enough clean data to train (need at least 40 labeled rows after NaN drop).")
+
+    X = combined[features.columns].values
+    y = (combined["label"] == "invest").astype(int).values  # 1=invest, 0=no-invest
+
+    # Time-based split — last 30 rows as test
+    split = len(X) - 30
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    clf = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=5,
+        min_samples_leaf=5,
+        class_weight="balanced",
+        random_state=42,
+    )
+    clf.fit(X_train, y_train)
+
+    return {
+        "model":          clf,
+        "feature_names":  list(features.columns),
+        "X_test":         X_test,
+        "y_test":         y_test,
+        "train_size":     len(X_train),
+        "test_size":      len(X_test),
+        "last_row":       X[-1],          # most recent row for prediction
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -542,4 +705,287 @@ def backtest(
         "portfolio_value":  result["portfolio_value"],
         "benchmark_value":  result["benchmark_value"],
         "summary":          summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Export endpoint
+# ---------------------------------------------------------------------------
+@app.get("/export")
+def export_csv(
+    ticker: str = "NVDA",
+    period: str = "1y",
+    interval: str = "1d",
+):
+    ticker   = _validate_ticker(ticker)
+    period   = _validate_period(period)
+    interval = _validate_interval(interval)
+
+    intraday = interval in {"1m", "5m", "15m", "30m", "60m", "1h"}
+    ttl = 60 if intraday else 300
+    cache_key = f"{ticker}:{period}:{interval}"
+    records = _cache_get(cache_key, ttl)
+
+    if records is None:
+        try:
+            import pandas as pd
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Yahoo Finance error: {exc}")
+
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data returned for '{ticker}'.")
+
+        df = _flatten_df(df)
+        records = _df_to_records(df)
+        _cache_set(cache_key, records)
+
+    import pandas as pd
+    df = pd.DataFrame(records)
+
+    # Compute all indicators
+    all_indicators = ["MA20", "MA50", "BB", "RSI", "MACD"]
+    inds   = _compute_indicators(df, all_indicators)
+    labels = _compute_labels(df)
+
+    # Build CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Metadata header rows
+    writer.writerow(["# Ticker",   ticker])
+    writer.writerow(["# Period",   period])
+    writer.writerow(["# Interval", interval])
+    writer.writerow(["# Exported", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")])
+    writer.writerow([])  # blank separator
+
+    # Column headers
+    writer.writerow([
+        "Date", "Open", "High", "Low", "Close", "Volume",
+        "MA20", "MA50", "BB_Upper", "BB_Lower",
+        "RSI", "MACD", "Label",
+    ])
+
+    # Data rows
+    n = len(records)
+    for i in range(n):
+        r = records[i]
+        def fmt(v):
+            return round(v, 4) if v is not None else ""
+
+        writer.writerow([
+            r["Date"],
+            fmt(r["Open"]),
+            fmt(r["High"]),
+            fmt(r["Low"]),
+            fmt(r["Close"]),
+            fmt(r["Volume"]),
+            fmt(inds.get("MA20",  [None]*n)[i]),
+            fmt(inds.get("MA50",  [None]*n)[i]),
+            fmt(inds.get("BB_upper", [None]*n)[i]),
+            fmt(inds.get("BB_lower", [None]*n)[i]),
+            fmt(inds.get("RSI",   [None]*n)[i]),
+            fmt(inds.get("MACD",  [None]*n)[i]),
+            labels[i] if labels[i] is not None else "",
+        ])
+
+    output.seek(0)
+    filename = f"{ticker}_{period}_{interval}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/export/backtest")
+def export_backtest_csv(
+    ticker: str = "NVDA",
+    period: str = "1y",
+    interval: str = "1d",
+    initial_capital: float = 10000.0,
+):
+    ticker   = _validate_ticker(ticker)
+    period   = _validate_period(period)
+    interval = _validate_interval(interval)
+
+    if initial_capital <= 0:
+        raise HTTPException(status_code=400, detail="initial_capital must be greater than 0.")
+
+    if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Backtesting requires a daily or wider interval (1d, 1wk, 1mo).",
+        )
+
+    ttl = 300
+    cache_key = f"{ticker}:{period}:{interval}"
+    records = _cache_get(cache_key, ttl)
+
+    if records is None:
+        try:
+            import pandas as pd
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Yahoo Finance error: {exc}")
+
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data returned for '{ticker}'.")
+
+        df = _flatten_df(df)
+        records = _df_to_records(df)
+        _cache_set(cache_key, records)
+
+    if len(records) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough data to run backtest (need at least 20 rows for MA20).",
+        )
+
+    import pandas as pd
+    df      = pd.DataFrame(records)
+    labels  = _compute_labels(df)
+    result  = _run_backtest(df, labels, initial_capital)
+    summary = _compute_backtest_summary(result["portfolio_value"], result["benchmark_value"], labels)
+
+    # Build CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Metadata header rows
+    writer.writerow(["# Ticker",           ticker])
+    writer.writerow(["# Period",           period])
+    writer.writerow(["# Interval",         interval])
+    writer.writerow(["# Initial Capital",  initial_capital])
+    writer.writerow(["# Strategy Return",  f"{summary['strategy_return']}%"])
+    writer.writerow(["# Buy & Hold Return",f"{summary['buyhold_return']}%"])
+    writer.writerow(["# Max Drawdown",     f"{summary['max_drawdown']}%"])
+    writer.writerow(["# Invest Days",      summary["invest_days"]])
+    writer.writerow(["# Exported",         datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")])
+    writer.writerow([])  # blank separator
+
+    # Column headers
+    writer.writerow(["Date", "Strategy_Value", "Benchmark_Value", "Label"])
+
+    # Data rows
+    for i, date in enumerate(result["dates"]):
+        writer.writerow([
+            date,
+            result["portfolio_value"][i],
+            result["benchmark_value"][i],
+            labels[i] if labels[i] is not None else "",
+        ])
+
+    output.seek(0)
+    filename = f"{ticker}_{period}_{interval}_backtest.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Predict endpoint
+# ---------------------------------------------------------------------------
+@app.get("/predict")
+def predict(
+    ticker: str = "NVDA",
+    period: str = "1y",
+    interval: str = "1d",
+):
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    import pandas as pd
+
+    ticker   = _validate_ticker(ticker)
+    period   = _validate_period(period)
+    interval = _validate_interval(interval)
+
+    if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+        raise HTTPException(
+            status_code=400,
+            detail="ML prediction requires a daily or wider interval (1d, 1wk, 1mo).",
+        )
+
+    # Fetch / cache OHLCV
+    ttl = 300
+    cache_key = f"{ticker}:{period}:{interval}"
+    records = _cache_get(cache_key, ttl)
+
+    if records is None:
+        try:
+            df_raw = yf.download(ticker, period=period, interval=interval, progress=False)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Yahoo Finance error: {exc}")
+
+        if df_raw is None or df_raw.empty:
+            raise HTTPException(status_code=404, detail=f"No data returned for '{ticker}'.")
+
+        df_raw = _flatten_df(df_raw)
+        records = _df_to_records(df_raw)
+        _cache_set(cache_key, records)
+
+    if len(records) < 60:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough data for ML (need at least 60 rows).",
+        )
+
+    df = pd.DataFrame(records)
+    labels = _compute_labels(df)
+
+    # Use cached model if available, otherwise train
+    model_key = f"{ticker}:{period}:{interval}"
+    if model_key not in _model_cache:
+        try:
+            bundle = _train_model(df, labels)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        _model_cache[model_key] = bundle
+    else:
+        bundle = _model_cache[model_key]
+
+    clf           = bundle["model"]
+    X_test        = bundle["X_test"]
+    y_test        = bundle["y_test"]
+    feature_names = bundle["feature_names"]
+    last_row      = bundle["last_row"]
+
+    # Predict on latest row
+    pred     = clf.predict([last_row])[0]
+    proba    = clf.predict_proba([last_row])[0]
+    signal   = "BUY" if pred == 1 else "SELL"
+    confidence = round(float(max(proba)) * 100, 1)
+
+    # Evaluation metrics on held-out test set
+    y_pred = clf.predict(X_test)
+    metrics = {
+        "accuracy":  round(float(accuracy_score(y_test, y_pred)), 4),
+        "precision": round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
+        "recall":    round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
+        "f1":        round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
+    }
+
+    # Feature importances
+    feature_importances = {
+        name: round(float(imp), 4)
+        for name, imp in zip(feature_names, clf.feature_importances_)
+    }
+
+    # ML artifact metadata
+    ml_metadata = {
+        "ticker":      ticker,
+        "date_range":  f"{records[0]['Date']} to {records[-1]['Date']}",
+        "random_seed": 42,
+        "train_size":  bundle["train_size"],
+        "test_size":   bundle["test_size"],
+    }
+
+    return {
+        "ticker":               ticker,
+        "signal":               signal,
+        "confidence":           confidence,
+        "metrics":              metrics,
+        "feature_importances":  feature_importances,
+        "ml_metadata":          ml_metadata,
     }

@@ -7,13 +7,63 @@ import {
 
 const API = "http://127.0.0.1:8000";
 
+// ── Loading spinner ───────────────────────────────────────────────────────────
+const spinKeyframes = `
+@keyframes spin { to { transform: rotate(360deg); } }
+`;
+if (typeof document !== "undefined") {
+  const style = document.createElement("style");
+  style.textContent = spinKeyframes;
+  document.head.appendChild(style);
+}
+function Spinner({ size = 16, color = "currentColor" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+      style={{ animation: "spin 0.75s linear infinite", flexShrink: 0 }}>
+      <circle cx="12" cy="12" r="10" stroke={color} strokeWidth="3" strokeOpacity="0.25" />
+      <path d="M12 2a10 10 0 0 1 10 10" stroke={color} strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 const INDICATOR_OPTIONS = [
-  { key: "BB",   label: "Bollinger Bands", color: "#a78bfa" },
-  { key: "RSI",  label: "RSI (14)",        color: "#38bdf8" },
-  { key: "MACD", label: "MACD",            color: "#fb7185" },
+  { key: "BB",   label: "Bollinger Bands", color: "#a78bfa",
+    tip: "Shows price volatility using three bands around a 20-day average. Wide bands = high volatility; narrow bands = low volatility. Price touching the upper band may signal overbought; lower band may signal oversold." },
+  { key: "RSI",  label: "RSI (14)",        color: "#38bdf8",
+    tip: "Relative Strength Index — measures buying/selling pressure on a 0–100 scale. Above 70 means the stock may be overbought (too expensive); below 30 means it may be oversold (too cheap). Useful for spotting reversals." },
+  { key: "MACD", label: "MACD",            color: "#fb7185",
+    tip: "Moving Average Convergence Divergence — compares two moving averages to reveal momentum. When the MACD line crosses above the signal line it's a bullish sign; crossing below is bearish. The histogram shows the gap between the two lines." },
 ];
 
 const COMPARE_COLORS = ["#60a5fa", "#34d399", "#f87171", "#fbbf24", "#a78bfa"];
+
+// ── Plain-language info tooltip ───────────────────────────────────────────────
+function InfoTip({ text }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <span style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+      <span
+        onMouseEnter={() => setVisible(true)}
+        onMouseLeave={() => setVisible(false)}
+        style={{ cursor: "default", fontSize: 12, color: "#94a3b8", lineHeight: 1,
+          width: 15, height: 15, borderRadius: "50%", border: "1px solid #cbd5e1",
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
+          fontWeight: 700, flexShrink: 0 }}>
+        ?
+      </span>
+      {visible && (
+        <span style={{
+          position: "absolute", left: 20, top: "50%", transform: "translateY(-50%)",
+          background: "#1e293b", color: "#f1f5f9", fontSize: 12, lineHeight: 1.5,
+          padding: "8px 12px", borderRadius: 6, width: 220, zIndex: 100,
+          boxShadow: "0 4px 12px rgba(0,0,0,0.15)", pointerEvents: "none",
+        }}>
+          {text}
+        </span>
+      )}
+    </span>
+  );
+}
 
 // ── Group consecutive same-label rows into spans ──────────────────────────────
 function getLabelSpans(labels) {
@@ -181,6 +231,9 @@ export default function App() {
   const [backtestData, setBacktestData]       = useState(null);
   const [backtestLoading, setBacktestLoading] = useState(false);
 
+  const [mlData, setMlData]                   = useState(null);
+  const [mlLoading, setMlLoading]             = useState(false);
+
   const [compareInput, setCompareInput]       = useState("");
   const [compareTickers, setCompareTickers]   = useState([]);
   const [compareData, setCompareData]         = useState(null);
@@ -325,6 +378,39 @@ export default function App() {
     }
   }
 
+  async function runML() {
+    setMlLoading(true);
+    setError(null);
+    try {
+      const url = `${API}/predict?ticker=${ticker}&period=${period}&interval=${interval}`;
+      let res;
+      try {
+        res = await fetch(url);
+      } catch {
+        setError({ type: "network", message: "Cannot connect to the backend server. Make sure FastAPI is running on port 8000." });
+        return;
+      }
+      if (res.status === 400) {
+        const err = await res.json().catch(() => ({}));
+        setError({ type: "validation", message: err.detail || "Invalid parameters for ML prediction." });
+        return;
+      }
+      if (res.status === 502) {
+        setError({ type: "provider", message: "Yahoo Finance is currently unavailable. Please try again in a moment." });
+        return;
+      }
+      if (!res.ok) {
+        setError({ type: "network", message: `Unexpected server error (HTTP ${res.status}). Please try again.` });
+        return;
+      }
+      setMlData(await res.json());
+    } catch (e) {
+      setError({ type: "network", message: e.message || "ML prediction failed unexpectedly." });
+    } finally {
+      setMlLoading(false);
+    }
+  }
+
   const chartData = rows.map((r, i) => ({
     date:         r.Date,
     close:        r.Close,
@@ -454,10 +540,11 @@ export default function App() {
           <div>
             <span style={lbl}>Indicators</span>
             <div style={{ display: "flex", flexDirection: "column", gap: 9, padding: "10px 12px", background: "#f8fafc", borderRadius: 7, border: "1px solid #e2e8f0" }}>
-              {INDICATOR_OPTIONS.map(({ key, label, color }) => (
+              {INDICATOR_OPTIONS.map(({ key, label, color, tip }) => (
                 <label key={key} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 14, userSelect: "none" }}>
                   <input type="checkbox" checked={selectedIndicators.includes(key)} onChange={() => toggleIndicator(key)} />
-                  <span style={{ color, fontWeight: 500 }}>{label}</span>
+                  <span style={{ color, fontWeight: 500, flex: 1 }}>{label}</span>
+                  <InfoTip text={tip} />
                 </label>
               ))}
             </div>
@@ -479,9 +566,31 @@ export default function App() {
           <button
             onClick={analyze}
             disabled={loading}
-            style={{ ...btnPrimary, width: "100%", padding: "11px 0", fontSize: 15, marginTop: 4, opacity: loading ? 0.7 : 1 }}>
+            style={{ ...btnPrimary, width: "100%", padding: "11px 0", fontSize: 15, marginTop: 4, opacity: loading ? 0.7 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {loading && <Spinner size={15} color="#fff" />}
             {loading ? "Loading…" : "Analyze"}
           </button>
+
+          {/* Export CSV button */}
+          {rows.length > 0 && (
+            <a
+              href={`${API}/export?ticker=${ticker}&period=${period}&interval=${interval}`}
+              download
+              style={{ ...btnSec, width: "100%", padding: "9px 0", fontSize: 14, textAlign: "center", textDecoration: "none", display: "block", boxSizing: "border-box", border: "1px solid #e2e8f0" }}>
+              Export CSV
+            </a>
+          )}
+
+          {/* ML Evaluation button */}
+          {rows.length > 0 && (
+            <button
+              onClick={() => { setMlData(null); runML(); }}
+              disabled={mlLoading}
+              style={{ ...btnSec, width: "100%", padding: "9px 0", fontSize: 14, border: "1px solid #e2e8f0", opacity: mlLoading ? 0.7 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              {mlLoading && <Spinner size={14} color="#475569" />}
+              {mlLoading ? "Running ML…" : mlData ? "Re-run ML Evaluation" : "ML Evaluation (Optional)"}
+            </button>
+          )}
 
         </div>
 
@@ -523,7 +632,8 @@ export default function App() {
           <button
             onClick={compareStocks}
             disabled={compareLoading || compareTickers.length === 0}
-            style={{ ...btnPrimary, width: "100%", padding: "9px 0", fontSize: 14, opacity: (compareLoading || compareTickers.length === 0) ? 0.5 : 1 }}>
+            style={{ ...btnPrimary, width: "100%", padding: "9px 0", fontSize: 14, opacity: (compareLoading || compareTickers.length === 0) ? 0.5 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {compareLoading && <Spinner size={14} color="#fff" />}
             {compareLoading ? "Loading…" : "Run Compare"}
           </button>
         </div>
@@ -625,6 +735,7 @@ export default function App() {
           {[
             { key: "price",    label: "Price & Indicators" },
             { key: "backtest", label: "Backtest" },
+            { key: "guide",    label: "Guide" },
           ].map(({ key, label }) => (
             <button key={key} onClick={() => setActiveTab(key)} style={{
               padding: "9px 20px",
@@ -641,6 +752,96 @@ export default function App() {
             </button>
           ))}
         </div>
+
+        {/* ── GUIDE TAB ── */}
+        {activeTab === "guide" && (() => {
+          const guideCard = { ...card, marginBottom: 16 };
+          const h2s = { margin: "0 0 8px 0", fontSize: 17, fontWeight: 700, color: "#0f172a" };
+          const body = { margin: 0, fontSize: 14, color: "#475569", lineHeight: 1.7 };
+          const tag = (text, bg, color) => (
+            <span style={{ display: "inline-block", background: bg, color, fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 4, marginRight: 6 }}>{text}</span>
+          );
+          return (
+            <div>
+              {/* Intro */}
+              <div style={guideCard}>
+                <h2 style={{ ...h2s, fontSize: 20, marginBottom: 6 }}>Welcome to the Stock Trends Analysis Dashboard</h2>
+                <p style={body}>This dashboard lets you explore historical stock price data, visualise technical indicators, simulate an investment strategy, and get a machine learning signal — all in one place. This guide explains every feature in plain language, no finance background required.</p>
+              </div>
+
+              {/* Buy & Hold */}
+              <div style={guideCard}>
+                <h2 style={h2s}>What is Buy & Hold?</h2>
+                <p style={body}>Buy & Hold is the simplest investment strategy: you buy a stock on day one and hold it until the end of the period, regardless of what happens in between. It is used as a <strong>benchmark</strong> — a baseline to compare any other strategy against. If your strategy beats Buy & Hold, it adds value. If it doesn't, you'd be better off just buying and waiting.</p>
+              </div>
+
+              {/* Invest / No-Invest Labels */}
+              <div style={guideCard}>
+                <h2 style={h2s}>Invest vs No-Invest Labels</h2>
+                <p style={{ ...body, marginBottom: 10 }}>Every trading day is automatically labelled using a simple rule:</p>
+                <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                  <div style={{ flex: 1, background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 8, padding: "10px 14px" }}>
+                    {tag("INVEST", "#dcfce7", "#15803d")}
+                    <p style={{ ...body, marginTop: 6 }}>Today's closing price is <strong>above</strong> the 20-day moving average → the stock is in a short-term uptrend.</p>
+                  </div>
+                  <div style={{ flex: 1, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "10px 14px" }}>
+                    {tag("NO-INVEST", "#fee2e2", "#b91c1c")}
+                    <p style={{ ...body, marginTop: 6 }}>Today's closing price is <strong>at or below</strong> the 20-day moving average → the stock is in a short-term downtrend.</p>
+                  </div>
+                </div>
+                <p style={body}>These labels are shown as coloured background regions on the price chart. The first 19 days have no label because the 20-day moving average needs at least 20 data points to be calculated.</p>
+              </div>
+
+              {/* Technical Indicators */}
+              <div style={guideCard}>
+                <h2 style={h2s}>Technical Indicators</h2>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 10 }}>
+                  {[
+                    { name: "MA20 / MA50 / MA200", color: "#6366f1",
+                      desc: "Moving Averages smooth out daily price noise by averaging the closing price over the last 20, 50, or 200 days. A rising MA suggests an uptrend; a falling MA suggests a downtrend. When a short MA crosses above a long MA it is often seen as a bullish signal (and vice versa)." },
+                    { name: "Bollinger Bands (BB)", color: "#a78bfa",
+                      desc: "Three lines drawn around a 20-day moving average: an upper band (+2 standard deviations) and a lower band (−2 standard deviations). When the bands are wide, price is volatile. When they are narrow, price is calm. Price touching the upper band may indicate the stock is stretched; touching the lower band may indicate it is oversold." },
+                    { name: "RSI (14)", color: "#38bdf8",
+                      desc: "The Relative Strength Index measures buying and selling pressure on a scale of 0–100. A reading above 70 suggests the stock may be overbought (due for a pullback). A reading below 30 suggests it may be oversold (due for a bounce). It is most useful for spotting potential turning points." },
+                    { name: "MACD", color: "#fb7185",
+                      desc: "Moving Average Convergence Divergence compares a fast 12-day EMA with a slow 26-day EMA. The difference between them is the MACD line. A 9-day average of that is the signal line. When the MACD line crosses above the signal line it suggests bullish momentum; crossing below suggests bearish momentum. The histogram bars show the gap between the two lines." },
+                  ].map(({ name, color, desc }) => (
+                    <div key={name} style={{ borderLeft: `3px solid ${color}`, paddingLeft: 12 }}>
+                      <p style={{ margin: "0 0 4px 0", fontWeight: 700, fontSize: 14, color: "#0f172a" }}>{name}</p>
+                      <p style={{ ...body, fontSize: 13 }}>{desc}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Backtest */}
+              <div style={guideCard}>
+                <h2 style={h2s}>What Does the Backtest Do?</h2>
+                <p style={{ ...body, marginBottom: 8 }}>The backtest simulates what would have happened if you had followed the invest/no-invest labels historically, starting with a fixed amount of capital:</p>
+                <ul style={{ ...body, paddingLeft: 20, margin: "0 0 8px 0" }}>
+                  <li><strong>Strategy (blue line):</strong> Your portfolio grows only on days labelled "invest". On "no-invest" days your money sits in cash and earns nothing.</li>
+                  <li><strong>Buy & Hold (grey dashed):</strong> Your portfolio is invested every single day regardless of labels.</li>
+                </ul>
+                <p style={{ ...body, marginBottom: 8 }}>The <strong>equity curve</strong> shows how both portfolios grew over time. If the blue line ends higher than the grey line, the label-based strategy outperformed Buy & Hold over that period.</p>
+                <p style={body}><strong>Max Drawdown</strong> is the largest peak-to-trough drop the strategy experienced — it tells you the worst loss you would have faced before recovering.</p>
+              </div>
+
+              {/* ML Signal */}
+              <div style={guideCard}>
+                <h2 style={h2s}>ML Signal — BUY / SELL</h2>
+                <p style={{ ...body, marginBottom: 8 }}>A Random Forest machine learning model is trained on 4 features derived from the price history — MACD histogram, daily return, 20-day volatility, and volume change. It learns to predict whether tomorrow's label will be "invest" (BUY) or "no-invest" (SELL).</p>
+                <ul style={{ ...body, paddingLeft: 20, margin: "0 0 8px 0" }}>
+                  <li><strong>Signal:</strong> BUY or SELL based on the model's prediction for the most recent data point.</li>
+                  <li><strong>Confidence:</strong> How certain the model is (e.g. 88% means 88 out of 100 trees in the forest agreed).</li>
+                  <li><strong>Accuracy / F1:</strong> How well the model performed on a held-out test set of the last 30 days it had never seen during training.</li>
+                </ul>
+                <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "10px 14px" }}>
+                  <p style={{ ...body, fontSize: 13, color: "#92400e" }}><strong>Important:</strong> This signal is for educational purposes only. It is not financial advice and should not be used to make real investment decisions. Past model performance does not guarantee future accuracy.</p>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Error */}
         {error && (() => {
@@ -686,7 +887,8 @@ export default function App() {
                     </p>
                   </div>
                   <button onClick={runBacktest} disabled={backtestLoading}
-                    style={{ ...btnPrimary, whiteSpace: "nowrap", opacity: backtestLoading ? 0.7 : 1 }}>
+                    style={{ ...btnPrimary, whiteSpace: "nowrap", opacity: backtestLoading ? 0.7 : 1, display: "flex", alignItems: "center", gap: 8 }}>
+                    {backtestLoading && <Spinner size={14} color="#fff" />}
                     {backtestLoading ? "Running…" : "Run Backtest"}
                   </button>
                 </div>
@@ -705,7 +907,7 @@ export default function App() {
                     <LineChart data={btChartData}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                       <XAxis dataKey="date" hide />
-                      <YAxis stroke="#94a3b8" tickFormatter={(v) => `$${v.toLocaleString()}`} />
+                      <YAxis stroke="#94a3b8" tickFormatter={(v) => `$${v.toLocaleString()}`} label={{ value: "Portfolio Value ($)", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 60 }} />
                       <Tooltip
                         contentStyle={ttStyle}
                         formatter={(val, name) => [`$${val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, name]}
@@ -721,7 +923,15 @@ export default function App() {
               {/* Summary Metrics panel */}
               {backtestData?.summary && (
                 <div style={card}>
-                  <h3 style={{ margin: "0 0 16px 0", fontSize: 18, color: "#0f172a" }}>Backtest Summary</h3>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                    <h3 style={{ margin: 0, fontSize: 18, color: "#0f172a" }}>Backtest Summary</h3>
+                    <a
+                      href={`${API}/export/backtest?ticker=${ticker}&period=${period}&interval=${interval}&initial_capital=${initialCapital}`}
+                      download
+                      style={{ ...btnSec, fontSize: 13, padding: "6px 14px", textDecoration: "none", border: "1px solid #e2e8f0" }}>
+                      Export Backtest CSV
+                    </a>
+                  </div>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
                     {[
                       {
@@ -780,8 +990,8 @@ export default function App() {
                 <ResponsiveContainer width="100%" height={430}>
                   <LineChart data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                    <XAxis dataKey="date" hide />
-                    <YAxis domain={["auto", "auto"]} stroke="#94a3b8" />
+                    <XAxis dataKey="date" hide label={{ value: "Date", position: "insideBottom", fill: "#94a3b8", fontSize: 11 }} />
+                    <YAxis domain={["auto", "auto"]} stroke="#94a3b8" label={{ value: "Price ($)", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 40 }} />
                     <Tooltip contentStyle={ttStyle} />
                     <Legend />
                     {getLabelSpans(labels).map(({ label, start, end }, idx) => (
@@ -855,11 +1065,12 @@ export default function App() {
                   <LineChart data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                     <XAxis dataKey="date" hide />
-                    <YAxis domain={[0, 100]} stroke="#94a3b8" ticks={[0, 30, 50, 70, 100]} />
+                    <YAxis domain={[0, 100]} stroke="#94a3b8" ticks={[0, 30, 50, 70, 100]} label={{ value: "RSI", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 15 }} />
                     <Tooltip contentStyle={ttStyle} />
-                    <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3" label={{ value: "70", fill: "#ef4444", fontSize: 12 }} />
-                    <ReferenceLine y={30} stroke="#22c55e" strokeDasharray="3 3" label={{ value: "30", fill: "#22c55e", fontSize: 12 }} />
-                    <Line type="monotone" dataKey="RSI" dot={false} stroke="#38bdf8" strokeWidth={1.5} />
+                    <Legend />
+                    <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3" label={{ value: "Overbought (70)", fill: "#ef4444", fontSize: 11 }} />
+                    <ReferenceLine y={30} stroke="#22c55e" strokeDasharray="3 3" label={{ value: "Oversold (30)", fill: "#22c55e", fontSize: 11 }} />
+                    <Line type="monotone" dataKey="RSI" dot={false} stroke="#38bdf8" strokeWidth={1.5} name="RSI (14)" />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -873,13 +1084,13 @@ export default function App() {
                   <ComposedChart data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                     <XAxis dataKey="date" hide />
-                    <YAxis stroke="#94a3b8" />
+                    <YAxis stroke="#94a3b8" label={{ value: "MACD", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 25 }} />
                     <Tooltip contentStyle={ttStyle} />
+                    <Legend />
                     <ReferenceLine y={0} stroke="#94a3b8" />
                     <Bar dataKey="MACD_hist" fill="#94a3b8" name="Histogram" opacity={0.7} />
                     <Line type="monotone" dataKey="MACD"        dot={false} stroke="#fb7185" name="MACD"   strokeWidth={1.5} />
                     <Line type="monotone" dataKey="MACD_signal" dot={false} stroke="#f59e0b" name="Signal" strokeWidth={1.5} />
-                    <Legend />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
@@ -892,9 +1103,10 @@ export default function App() {
                 <BarChart data={chartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                   <XAxis dataKey="date" hide />
-                  <YAxis stroke="#94a3b8" />
-                  <Tooltip contentStyle={ttStyle} />
-                  <Bar dataKey="volume" fill="#3b82f6" opacity={0.6} />
+                  <YAxis stroke="#94a3b8" tickFormatter={(v) => v >= 1e9 ? `${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `${(v/1e6).toFixed(0)}M` : v} label={{ value: "Volume", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 30 }} />
+                  <Tooltip contentStyle={ttStyle} formatter={(v) => [v.toLocaleString(), "Volume"]} />
+                  <Legend />
+                  <Bar dataKey="volume" fill="#3b82f6" opacity={0.6} name="Volume" />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -915,9 +1127,9 @@ export default function App() {
               <LineChart data={compareChartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                 <XAxis dataKey="date" hide />
-                <YAxis stroke="#94a3b8" />
-                <Tooltip contentStyle={ttStyle} />
-                <ReferenceLine y={100} stroke="#94a3b8" strokeDasharray="3 3" />
+                <YAxis stroke="#94a3b8" label={{ value: "Normalised Value", angle: -90, position: "insideLeft", fill: "#94a3b8", fontSize: 11, dy: 55 }} />
+                <Tooltip contentStyle={ttStyle} formatter={(v, name) => [v?.toFixed(2), name]} />
+                <ReferenceLine y={100} stroke="#94a3b8" strokeDasharray="3 3" label={{ value: "Base (100)", fill: "#94a3b8", fontSize: 11 }} />
                 <Legend />
                 {compareData.tickers.map((t, i) => (
                   <Line key={t} type="monotone" dataKey={t} dot={false}
@@ -925,6 +1137,98 @@ export default function App() {
                 ))}
               </LineChart>
             </ResponsiveContainer>
+          </div>
+        )}
+
+        {/* ── ML PANEL ── */}
+        {mlData && (
+          <div style={card}>
+            <h3 style={{ margin: "0 0 20px 0", fontSize: 20, color: "#0f172a" }}>ML Evaluation — {mlData.ticker}</h3>
+
+            {/* BUY / SELL badge + confidence */}
+            <div style={{ display: "flex", alignItems: "center", gap: 24, marginBottom: 8 }}>
+              <div style={{
+                padding: "10px 28px",
+                borderRadius: 8,
+                fontSize: 28,
+                fontWeight: 800,
+                letterSpacing: "0.06em",
+                background: mlData.signal === "BUY" ? "#f0fdf4" : "#fef2f2",
+                color:      mlData.signal === "BUY" ? "#15803d"  : "#b91c1c",
+                border: `2px solid ${mlData.signal === "BUY" ? "#22c55e" : "#ef4444"}`,
+              }}>
+                {mlData.signal}
+              </div>
+              <div>
+                <p style={{ margin: "0 0 4px 0", fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>Confidence</p>
+                <p style={{ margin: 0, fontSize: 28, fontWeight: 700, color: "#0f172a" }}>{mlData.confidence}%</p>
+              </div>
+              {/* Confidence bar */}
+              <div style={{ flex: 1 }}>
+                <div style={{ height: 10, borderRadius: 5, background: "#e2e8f0", overflow: "hidden" }}>
+                  <div style={{
+                    width: `${mlData.confidence}%`,
+                    height: "100%",
+                    background: mlData.signal === "BUY" ? "#22c55e" : "#ef4444",
+                    transition: "width 0.4s ease",
+                  }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Metrics table */}
+            <div style={{ marginTop: 20, marginBottom: 16 }}>
+              <p style={{ margin: "0 0 10px 0", fontSize: 12, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Model Evaluation — held-out test set ({mlData.ml_metadata.test_size} days)
+              </p>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+                {[
+                  { label: "Accuracy",  value: mlData.metrics.accuracy },
+                  { label: "Precision", value: mlData.metrics.precision },
+                  { label: "Recall",    value: mlData.metrics.recall },
+                  { label: "F1 Score",  value: mlData.metrics.f1 },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: "12px 14px" }}>
+                    <p style={{ margin: "0 0 4px 0", fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</p>
+                    <p style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#0f172a" }}>{(value * 100).toFixed(1)}%</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Feature importance bar chart */}
+            {(() => {
+              const importanceData = Object.entries(mlData.feature_importances)
+                .map(([name, value]) => ({ name, value }))
+                .sort((a, b) => b.value - a.value);
+              return (
+                <div style={{ marginBottom: 16 }}>
+                  <p style={{ margin: "0 0 10px 0", fontSize: 12, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                    Feature Importance
+                  </p>
+                  <ResponsiveContainer width="100%" height={importanceData.length * 40 + 20}>
+                    <BarChart data={importanceData} layout="vertical" margin={{ left: 16, right: 40, top: 4, bottom: 4 }}>
+                      <XAxis type="number" domain={[0, 1]} tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} stroke="#94a3b8" fontSize={12} />
+                      <YAxis type="category" dataKey="name" width={110} stroke="#94a3b8" fontSize={13} />
+                      <Tooltip
+                        contentStyle={ttStyle}
+                        formatter={(v) => [`${(v * 100).toFixed(1)}%`, "Importance"]}
+                      />
+                      <Bar dataKey="value" fill="#3b82f6" radius={[0, 4, 4, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              );
+            })()}
+
+            {/* Disclaimer */}
+            <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "12px 14px" }}>
+              <p style={{ margin: 0, fontSize: 13, color: "#92400e", lineHeight: 1.6 }}>
+                <strong>Disclaimer:</strong> This signal is generated by a Random Forest model trained on historical price data.
+                It is intended for educational purposes only and does not constitute financial advice.
+                Past performance does not guarantee future results.
+              </p>
+            </div>
           </div>
         )}
 
